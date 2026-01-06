@@ -1,4 +1,10 @@
-# ESP32 OBD-II Emulator
+# ESP32 OBD-II Emulator (Enhanced Fork)
+
+This is an improved fork of the original ESP32 OBD-II Emulator, featuring:
+- **Modern Build System**: migrated to full CMake support for ESP-IDF.
+- **Improved Debugging**: Enhanced logging capabilities and debug modes.
+- **VS Code Integration**: Ready-to-use development environment configuration.
+- **Performance**: Optimized task stack sizes and memory usage.
 
 Open-source OBD-II emulator based on an ESP32 + CAN transceiver IC, controllable via WiFi through a simple web UI (or via API).
 
@@ -33,12 +39,32 @@ Open-source OBD-II emulator based on an ESP32 + CAN transceiver IC, controllable
 
 ### Connections
 
-**ESP32-S3 with TJA1051 (5V) + Level Shifter:**
-- ESP32-S3 GPIO 43 (RX) ← Level Shifter ← TJA1051 RXD
-- ESP32-S3 GPIO 44 (TX) → Level Shifter → TJA1051 TXD
-- TJA1051 VCC → 5V
-- TJA1051 STB → GND (normal mode)
-- TJA1051 CANH/CANL → CAN Bus (with 120Ω termination resistor if needed)
+**ESP32-S3 + TJA1051 (5V) with Voltage Divider:**
+Since the TJA1051 is a 5V device and the ESP32-S3 is 3.3V, a voltage divider is used on the RX line to protect the board.
+
+| ESP32 Pin | Connection | TJA1051 Pin |
+|---|---|---|
+| GPIO 15 (TX) | Direct Wire | TXD |
+| GPIO 16 (RX) | Voltage Divider | RXD |
+| - | 5V Power Supply | VCC |
+| GND | Common Ground | GND |
+| - | CAN Bus | CANH/CANL |
+
+**Voltage Divider (5V to 3.3V):**
+Protect the ESP32 RX pin using two resistors (2kΩ and 3kΩ) as a simple level shifter:
+
+```text
+                  2kΩ
+TJA1051 RXD o----[RES]----o----o ESP32 GPIO 16
+(5V Signal)               |
+                          |
+                         [RES] 3kΩ
+                          |
+                         GND
+```
+(This scales the 5V signal down to ~3V, which is safe for the ESP32).
+
+*Note: The TJA1051 board used in this project already has the 120Ω termination resistor installed. Ensure the other end of the bus is also terminated.*
 
 **Legacy ESP32-WROOM-32 with SN65HVD230 (3.3V):**
 - IO 4 → CAN RX
