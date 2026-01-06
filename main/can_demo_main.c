@@ -344,7 +344,7 @@ static void cb_GET_root(http_context_t http_ctx, void *ctx)
 		"<div class='col'><h1 id='current-speed'>0</h1><h3>SPEED (km/h)</h3>"
 		"<div class='slidecontainer'><input type='range' min='0' max='255' value='0' class='slider' id='speed'></div></div>"
 		"<div class='col'><h1 id='current-rpm'>0</h1><h3>RPM</h3>"
-		"<div class='slidecontainer'><input type='range' min='0' max='16654' value='0' class='slider' id='rpm'></div></div>"
+		"<div class='slidecontainer'><input type='range' min='0' max='16383' value='0' class='slider' id='rpm'></div></div>"
 		"<div class='col'><h1 id='current-throttle'>0</h1><h3>THROTTLE (%)</h3>"
 		"<div class='slidecontainer'><input type='range' min='0' max='100' value='0' class='slider' id='throttle'></div></div>"
 		"<div class='col'><h1 id='current-coolant'>90</h1><h3>COOLANT (°C)</h3>"
