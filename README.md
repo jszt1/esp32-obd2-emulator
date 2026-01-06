@@ -16,9 +16,11 @@ Open-source OBD-II emulator based on an ESP32 + CAN transceiver IC, controllable
 ## Supported modes & PIDs
 | Mode | PID  | Description                         |
 |------|------|-------------------------------------|
+| 0x01 | 0x05 | Engine coolant temperature          |
 | 0x01 | 0x0C | RPM                                 |
 | 0x01 | 0x0D | Vehicle speed                       |
 | 0x01 | 0x11 | Throttle position                   |
+| 0x01 | 0x2F | Fuel tank level input               |
 | 0x09 | 0x02 | Vehicle Identification Number (VIN) |
 
 ## Usage
