@@ -5,6 +5,7 @@
  *
  * Copyright (c) 2017, Thomas Barth, barth-dev.de
  *               2017, Jaime Breva, jbreva@nayarsystems.com
+ *               2025, Updated to use TWAI driver for ESP-IDF v5.5
  *
  * Permission is hereby granted, free of charge, to any person
  * obtaining a copy of this software and associated documentation
@@ -32,248 +33,245 @@
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/task.h"
 
-#include "esp_intr.h"
-#include "soc/dport_reg.h"
-#include <math.h>
-
+#include "driver/twai.h"
 #include "driver/gpio.h"
+#include "esp_log.h"
 
-#include "can_regdef.h"
 #include "CAN_config.h"
 
-static void CAN_read_frame_phy();
-static void CAN_isr(void *arg_p);
-static int CAN_write_frame_phy(const CAN_frame_t *p_frame);
-static SemaphoreHandle_t sem_tx_complete;
+static const char *TAG = "CAN";
+static TaskHandle_t rx_task_handle = NULL;
 
-static void CAN_isr(void *arg_p) {
-
-	// Interrupt flag buffer
-	__CAN_IRQ_t interrupt;
-	BaseType_t higherPriorityTaskWoken = pdFALSE;
-
-	// Read interrupt status and clear flags
-	interrupt = MODULE_CAN->IR.U;
-
-	// Handle RX frame available interrupt
-	if ((interrupt & __CAN_IRQ_RX) != 0)
-		CAN_read_frame_phy(&higherPriorityTaskWoken);
-
-	// Handle TX complete interrupt
-	// Handle error interrupts.
-	if ((interrupt & (__CAN_IRQ_TX | __CAN_IRQ_ERR //0x4
-	                  | __CAN_IRQ_DATA_OVERRUN     // 0x8
-	                  | __CAN_IRQ_WAKEUP           // 0x10
-	                  | __CAN_IRQ_ERR_PASSIVE      // 0x20
-	                  | __CAN_IRQ_ARB_LOST         // 0x40
-	                  | __CAN_IRQ_BUS_ERR          // 0x80
-	                  )) != 0) {
-		xSemaphoreGive(sem_tx_complete);
-	}
-
-	// check if any higher priority task has been woken by any handler
-	if (higherPriorityTaskWoken)
-		portYIELD_FROM_ISR();
+// Convert CAN speed enum to TWAI timing config
+static void get_twai_timing(CAN_speed_t speed, twai_timing_config_t *t_config) {
+    switch (speed) {
+        case CAN_SPEED_100KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_100KBITS();
+            break;
+        case CAN_SPEED_125KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_125KBITS();
+            break;
+        case CAN_SPEED_250KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_250KBITS();
+            break;
+        case CAN_SPEED_500KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS();
+            break;
+        case CAN_SPEED_800KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_800KBITS();
+            break;
+        case CAN_SPEED_1000KBPS:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_1MBITS();
+            break;
+        default:
+            *t_config = (twai_timing_config_t)TWAI_TIMING_CONFIG_500KBITS();
+            break;
+    }
+    
+    // Disable triple sampling temporarily for testing
+    t_config->triple_sampling = false;
 }
 
-static void CAN_read_frame_phy(BaseType_t *higherPriorityTaskWoken) {
+// RX task that reads TWAI messages and puts them in the queue
+static void twai_rx_task(void *arg) {
+    twai_message_t rx_msg;
+    CAN_frame_t can_frame;
+    
+    while (1) {
+        // Check for alerts (Bus Off, Error Passive, etc.)
+        uint32_t alerts;
+        if (twai_read_alerts(&alerts, 0) == ESP_OK) {
+            if (alerts & TWAI_ALERT_BUS_OFF) {
+                ESP_LOGE(TAG, "Bus Off condition occurred. Initiating recovery...");
+                twai_initiate_recovery();
+            }
+            if (alerts & TWAI_ALERT_BUS_RECOVERED) {
+                ESP_LOGI(TAG, "Bus Recovered. Restarting TWAI driver...");
+                twai_start();
+            }
+        }
 
-	// byte iterator
-	uint8_t __byte_i;
-
-	// frame read buffer
-	CAN_frame_t __frame;
-
-	// check if we have a queue. If not, operation is aborted.
-	if (CAN_cfg.rx_queue == NULL) {
-		// Let the hardware know the frame has been read.
-		MODULE_CAN->CMR.B.RRB = 1;
-		return;
-	}
-
-	// get FIR
-	__frame.FIR.U = MODULE_CAN->MBX_CTRL.FCTRL.FIR.U;
-
-	// check if this is a standard or extended CAN frame
-	// standard frame
-	if (__frame.FIR.B.FF == CAN_frame_std) {
-
-		// Get Message ID
-		__frame.MsgID = _CAN_GET_STD_ID;
-
-		// deep copy data bytes
-		for (__byte_i = 0; __byte_i < __frame.FIR.B.DLC; __byte_i++)
-			__frame.data.u8[__byte_i] = MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.STD.data[__byte_i];
-	}
-	// extended frame
-	else {
-
-		// Get Message ID
-		__frame.MsgID = _CAN_GET_EXT_ID;
-
-		// deep copy data bytes
-		for (__byte_i = 0; __byte_i < __frame.FIR.B.DLC; __byte_i++)
-			__frame.data.u8[__byte_i] = MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.EXT.data[__byte_i];
-	}
-
-	// send frame to input queue
-	xQueueSendToBackFromISR(CAN_cfg.rx_queue, &__frame, higherPriorityTaskWoken);
-
-	// Let the hardware know the frame has been read.
-	MODULE_CAN->CMR.B.RRB = 1;
-}
-
-static int CAN_write_frame_phy(const CAN_frame_t *p_frame) {
-
-	// byte iterator
-	uint8_t __byte_i;
-
-	// copy frame information record
-	MODULE_CAN->MBX_CTRL.FCTRL.FIR.U = p_frame->FIR.U;
-
-	// standard frame
-	if (p_frame->FIR.B.FF == CAN_frame_std) {
-
-		// Write message ID
-		_CAN_SET_STD_ID(p_frame->MsgID);
-
-		// Copy the frame data to the hardware
-		for (__byte_i = 0; __byte_i < p_frame->FIR.B.DLC; __byte_i++)
-			MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.STD.data[__byte_i] = p_frame->data.u8[__byte_i];
-
-	}
-	// extended frame
-	else {
-
-		// Write message ID
-		_CAN_SET_EXT_ID(p_frame->MsgID);
-
-		// Copy the frame data to the hardware
-		for (__byte_i = 0; __byte_i < p_frame->FIR.B.DLC; __byte_i++)
-			MODULE_CAN->MBX_CTRL.FCTRL.TX_RX.EXT.data[__byte_i] = p_frame->data.u8[__byte_i];
-	}
-
-	// Transmit frame
-	MODULE_CAN->CMR.B.TR = 1;
-
-	return 0;
+        // Wait for message to be received
+        if (twai_receive(&rx_msg, pdMS_TO_TICKS(100)) == ESP_OK) {
+            // Convert TWAI message to CAN frame format
+            can_frame.MsgID = rx_msg.identifier;
+            can_frame.FIR.B.DLC = rx_msg.data_length_code;
+            can_frame.FIR.B.FF = rx_msg.extd ? CAN_frame_ext : CAN_frame_std;
+            can_frame.FIR.B.RTR = rx_msg.rtr ? CAN_RTR : CAN_no_RTR;
+            
+            // Copy data
+            for (int i = 0; i < rx_msg.data_length_code && i < 8; i++) {
+                can_frame.data.u8[i] = rx_msg.data[i];
+            }
+            
+            // Send to queue if configured
+            if (CAN_cfg.rx_queue != NULL) {
+                xQueueSendToBack(CAN_cfg.rx_queue, &can_frame, 0);
+            }
+        }
+    }
 }
 
 int CAN_init() {
+    // Get TWAI timing configuration based on speed
+    twai_timing_config_t t_config;
+    get_twai_timing(CAN_cfg.speed, &t_config);
+    
+    // Configure TWAI general settings
+    twai_general_config_t g_config = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)CAN_cfg.tx_pin_id, 
+        (gpio_num_t)CAN_cfg.rx_pin_id, 
+        TWAI_MODE_NORMAL
+    );
+    g_config.alerts_enabled = TWAI_ALERT_BUS_OFF | TWAI_ALERT_BUS_RECOVERED | TWAI_ALERT_ERR_PASS | 
+                              TWAI_ALERT_BUS_ERROR | TWAI_ALERT_TX_FAILED | TWAI_ALERT_TX_SUCCESS;
 
-	// Time quantum
-	double __tq;
-
-	// enable module
-	DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_CAN_CLK_EN);
-	DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_CAN_RST);
-
-	// configure TX pin
-	gpio_set_level(CAN_cfg.tx_pin_id, 1);
-	gpio_set_direction(CAN_cfg.tx_pin_id, GPIO_MODE_OUTPUT);
-	gpio_matrix_out(CAN_cfg.tx_pin_id, CAN_TX_IDX, 0, 0);
-	gpio_pad_select_gpio(CAN_cfg.tx_pin_id);
-
-	// configure RX pin
-	gpio_set_direction(CAN_cfg.rx_pin_id, GPIO_MODE_INPUT);
-	gpio_matrix_in(CAN_cfg.rx_pin_id, CAN_RX_IDX, 0);
-	gpio_pad_select_gpio(CAN_cfg.rx_pin_id);
-
-	// set to PELICAN mode
-	MODULE_CAN->CDR.B.CAN_M = 0x1;
-
-	// synchronization jump width is the same for all baud rates
-	MODULE_CAN->BTR0.B.SJW = 0x1;
-
-	// TSEG2 is the same for all baud rates
-	MODULE_CAN->BTR1.B.TSEG2 = 0x1;
-
-	// select time quantum and set TSEG1
-	switch (CAN_cfg.speed) {
-	case CAN_SPEED_1000KBPS:
-		MODULE_CAN->BTR1.B.TSEG1 = 0x4;
-		__tq = 0.125;
-		break;
-
-	case CAN_SPEED_800KBPS:
-		MODULE_CAN->BTR1.B.TSEG1 = 0x6;
-		__tq = 0.125;
-		break;
-
-	case CAN_SPEED_200KBPS:
-		MODULE_CAN->BTR1.B.TSEG1 = 0xc;
-		MODULE_CAN->BTR1.B.TSEG2 = 0x5;
-		__tq = 0.25;
-		break;
-
-	default:
-		MODULE_CAN->BTR1.B.TSEG1 = 0xc;
-		__tq = ((float) 1000 / CAN_cfg.speed) / 16;
-	}
-
-	// set baud rate prescaler
-	MODULE_CAN->BTR0.B.BRP = (uint8_t) round((((APB_CLK_FREQ * __tq) / 2) - 1) / 1000000) - 1;
-
-	/* Set sampling
-	 * 1 -> triple; the bus is sampled three times; recommended for low/medium speed buses     (class A and B) where
-	 * filtering spikes on the bus line is beneficial 0 -> single; the bus is sampled once; recommended for high speed
-	 * buses (SAE class C)*/
-	MODULE_CAN->BTR1.B.SAM = 0x1;
-
-	// enable all interrupts
-	MODULE_CAN->IER.U = 0xff;
-
-	// no acceptance filtering, as we want to fetch all messages
-	MODULE_CAN->MBX_CTRL.ACC.CODE[0] = 0;
-	MODULE_CAN->MBX_CTRL.ACC.CODE[1] = 0;
-	MODULE_CAN->MBX_CTRL.ACC.CODE[2] = 0;
-	MODULE_CAN->MBX_CTRL.ACC.CODE[3] = 0;
-	MODULE_CAN->MBX_CTRL.ACC.MASK[0] = 0xff;
-	MODULE_CAN->MBX_CTRL.ACC.MASK[1] = 0xff;
-	MODULE_CAN->MBX_CTRL.ACC.MASK[2] = 0xff;
-	MODULE_CAN->MBX_CTRL.ACC.MASK[3] = 0xff;
-
-	// set to normal mode
-	MODULE_CAN->OCR.B.OCMODE = __CAN_OC_NOM;
-
-	// clear error counters
-	MODULE_CAN->TXERR.U = 0;
-	MODULE_CAN->RXERR.U = 0;
-	(void) MODULE_CAN->ECC;
-
-	// clear interrupt flags
-	(void) MODULE_CAN->IR.U;
-
-	// install CAN ISR
-	esp_intr_alloc(ETS_CAN_INTR_SOURCE, 0, CAN_isr, NULL, NULL);
-
-	// allocate the tx complete semaphore
-	sem_tx_complete = xSemaphoreCreateBinary();
-
-	// Showtime. Release Reset Mode.
-	MODULE_CAN->MOD.B.RM = 0;
-
-	return 0;
+    // Configure TWAI filter to accept all messages
+    twai_filter_config_t f_config = TWAI_FILTER_CONFIG_ACCEPT_ALL();
+    
+    // Install TWAI driver
+    esp_err_t ret = twai_driver_install(&g_config, &t_config, &f_config);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install TWAI driver: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    
+    // Start TWAI driver
+    ret = twai_start();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start TWAI driver: %s", esp_err_to_name(ret));
+        twai_driver_uninstall();
+        return -1;
+    }
+    
+    ESP_LOGI(TAG, "TWAI driver started on TX:%d RX:%d at %d kbps", 
+             CAN_cfg.tx_pin_id, CAN_cfg.rx_pin_id, CAN_cfg.speed);
+    
+    // Create RX task if queue is configured
+    if (CAN_cfg.rx_queue != NULL) {
+        xTaskCreate(twai_rx_task, "twai_rx", 4096, NULL, 5, &rx_task_handle);
+    }
+    
+    return 0;
 }
 
 int CAN_write_frame(const CAN_frame_t *p_frame) {
-	if (sem_tx_complete == NULL) {
-		return -1;
-	}
-
-	// Write the frame to the controller
-	CAN_write_frame_phy(p_frame);
-
-	// wait for the frame tx to complete
-	xSemaphoreTake(sem_tx_complete, portMAX_DELAY);
-
-	return 0;
+    // Convert CAN frame to TWAI message
+    twai_message_t tx_msg = {
+        .identifier = p_frame->MsgID,
+        .data_length_code = p_frame->FIR.B.DLC,
+        .extd = (p_frame->FIR.B.FF == CAN_frame_ext) ? 1 : 0,
+        .rtr = (p_frame->FIR.B.RTR == CAN_RTR) ? 1 : 0,
+        .ss = 0,
+        .self = 0,
+        .dlc_non_comp = 0,
+    };
+    
+    // Copy data
+    for (int i = 0; i < p_frame->FIR.B.DLC && i < 8; i++) {
+        tx_msg.data[i] = p_frame->data.u8[i];
+    }
+    
+    // Transmit message with 1 second timeout
+    esp_err_t ret = twai_transmit(&tx_msg, pdMS_TO_TICKS(1000));
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to transmit: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    
+    return 0;
 }
 
 int CAN_stop() {
-	// enter reset mode
-	MODULE_CAN->MOD.B.RM = 1;
-
-	return 0;
+    // Stop RX task
+    if (rx_task_handle != NULL) {
+        vTaskDelete(rx_task_handle);
+        rx_task_handle = NULL;
+    }
+    
+    // Stop TWAI driver
+    esp_err_t ret = twai_stop();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to stop TWAI: %s", esp_err_to_name(ret));
+    }
+    
+    // Uninstall TWAI driver
+    ret = twai_driver_uninstall();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to uninstall TWAI: %s", esp_err_to_name(ret));
+        return -1;
+    }
+    
+    ESP_LOGI(TAG, "TWAI driver stopped");
+    return 0;
 }
+
+void CAN_print_diagnostics(void) {
+    twai_status_info_t status_info;
+    
+    if (twai_get_status_info(&status_info) == ESP_OK) {
+        printf("\n========== CAN BUS DIAGNOSTICS ==========\n");
+        printf("State: ");
+        switch (status_info.state) {
+            case TWAI_STATE_RUNNING:
+                printf("RUNNING\n");
+                break;
+            case TWAI_STATE_BUS_OFF:
+                printf("BUS OFF (CRITICAL - Too many errors!)\n");
+                break;
+            case TWAI_STATE_RECOVERING:
+                printf("RECOVERING\n");
+                break;
+            case TWAI_STATE_STOPPED:
+                printf("STOPPED\n");
+                break;
+            default:
+                printf("UNKNOWN\n");
+                break;
+        }
+        
+        printf("TX Error Counter: %lu\n", (unsigned long)status_info.tx_error_counter);
+        printf("RX Error Counter: %lu\n", (unsigned long)status_info.rx_error_counter);
+        printf("Messages in TX Queue: %lu\n", (unsigned long)status_info.msgs_to_tx);
+        printf("Messages in RX Queue: %lu\n", (unsigned long)status_info.msgs_to_rx);
+        printf("TX Failed Count: %lu\n", (unsigned long)status_info.tx_failed_count);
+        printf("RX Missed Count: %lu\n", (unsigned long)status_info.rx_missed_count);
+        printf("RX Overrun Count: %lu\n", (unsigned long)status_info.rx_overrun_count);
+        printf("Arbitration Lost Count: %lu\n", (unsigned long)status_info.arb_lost_count);
+        printf("Bus Error Count: %lu\n", (unsigned long)status_info.bus_error_count);
+        
+        // Interpret error counters
+        printf("\n--- DIAGNOSIS ---\n");
+        if (status_info.tx_error_counter > 96) {
+            printf("⚠️  HIGH TX ERRORS! Usually means NO ACK from other devices.\n");
+            printf("   → Check: 1) Other device is powered and connected\n");
+            printf("   → Check: 2) 120Ω termination resistors at BOTH ends\n");
+            printf("   → Check: 3) CANH/CANL wiring is correct\n");
+        } else if (status_info.tx_error_counter > 0) {
+            printf("⚠️  Some TX errors detected (ACK issues).\n");
+        } else {
+            printf("✓ TX Error Counter: OK\n");
+        }
+        
+        if (status_info.rx_error_counter > 96) {
+            printf("⚠️  HIGH RX ERRORS! Check signal quality and termination.\n");
+        } else if (status_info.rx_error_counter > 0) {
+            printf("⚠️  Some RX errors detected.\n");
+        } else {
+            printf("✓ RX Error Counter: OK\n");
+        }
+        
+        if (status_info.state == TWAI_STATE_BUS_OFF) {
+            printf("\n🔴 BUS OFF STATE - CAN controller has shut down!\n");
+            printf("   This means too many consecutive errors occurred.\n");
+            printf("   Fix hardware issues, then restart the device.\n");
+        }
+        
+        printf("=========================================\n\n");
+    } else {
+        printf("ERROR: Could not read CAN status\n");
+    }
+}
+

@@ -3,9 +3,10 @@
 #include "esp_wifi.h"
 #include "esp_system.h"
 #include "esp_event.h"
-#include "esp_event_loop.h"
+#include "esp_netif.h"
 #include "nvs_flash.h"
 #include "esp_vfs_fat.h"
+#include <inttypes.h>
 
 #include "CAN.h"
 #include "CAN_config.h"
@@ -63,6 +64,8 @@ uint8_t can_flow_queue[5][8];
 unsigned int vehicle_speed = 0;
 float vehicle_rpm = 0;
 float vehicle_throttle = 0;
+float vehicle_coolant = 90;
+float vehicle_fuel_level = 100;
 char vehicle_vin[17] = "ESP32OBD2EMULATOR";
 
 static EventGroupHandle_t wifi_event_group;
@@ -70,23 +73,30 @@ static EventGroupHandle_t wifi_event_group;
 #define WIFI_SSID "ESP32-OBD2"
 #define WIFI_PASS "88888888"
 
+// Debug mode - set to 1 to enable detailed CAN frame logging
+// To enable: change to 1, rebuild (idf.py build), flash, and monitor serial output
+#define DEBUG_MODE 0
 
-esp_err_t event_handler(void *ctx, system_event_t *event)
-{
-	return ESP_OK;
-}
+#if DEBUG_MODE
+#define DEBUG_PRINT(fmt, ...) printf("[DEBUG] " fmt, ##__VA_ARGS__)
+#else
+#define DEBUG_PRINT(fmt, ...)
+#endif
 
 CAN_frame_t createOBDResponse(unsigned int mode, unsigned int pid)
 {
 	CAN_frame_t response;
 
-	response.MsgID = 0x7E8;
+	response.MsgID = 0x7E8; // Standard OBD2 ECU Response ID
 	response.FIR.B.DLC = 8;
 	response.FIR.B.FF = CAN_frame_std;
 	response.FIR.B.RTR = CAN_no_RTR;
-	response.data.u8[0] = 2; // Number of data bytes ()
+	// Length will be set by the caller based on data size
+	response.data.u8[0] = 2; // Default length (Mode + PID)
 	response.data.u8[1] = 0x40 + mode; // Mode (+ 0x40)
 	response.data.u8[2] = pid; // PID
+	// Initialize rest to padding
+	memset(&response.data.u8[3], 0x00, 5); // 0x00 is standard padding
 
 	return response;
 }
@@ -95,56 +105,75 @@ int sendOBDResponse(CAN_frame_t *response)
 {
 	int success = CAN_write_frame(response);
 
-	printf("Response = %d | (0x%03x) 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x 0x%02x\n",
-		   success, response->MsgID,
-		   response->data.u8[0], response->data.u8[1], response->data.u8[2], response->data.u8[3],
-		   response->data.u8[4], response->data.u8[5], response->data.u8[6], response->data.u8[7]);
+	DEBUG_PRINT("TX CAN Frame:\n");
+	DEBUG_PRINT("  MsgID: 0x%03" PRIx32 "\n", response->MsgID);
+	DEBUG_PRINT("  DLC: %d, RTR: %d, FF: %d\n", response->FIR.B.DLC, response->FIR.B.RTR, response->FIR.B.FF);
+	DEBUG_PRINT("  Data: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			   response->data.u8[0], response->data.u8[1], response->data.u8[2], response->data.u8[3],
+			   response->data.u8[4], response->data.u8[5], response->data.u8[6], response->data.u8[7]);
+	DEBUG_PRINT("  Status: %s\n\n", (success == 0) ? "OK" : "FAIL");
 	
 	return success;
 }
 
 void respondToOBD1(uint8_t pid)
 {
-	printf("Responding to Mode 1 PID 0x%02x\n", pid);
+	DEBUG_PRINT("Building Mode 1 response for PID 0x%02x\n", pid);
 
 	CAN_frame_t response = createOBDResponse(1, pid);
+	unsigned int A=0, B=0, C=0, D=0;
+	int data_len = 0;
 
 	switch (pid)
 	{
 		case 0x00: // Supported PIDs
-			response.data.u8[0] += 4; // Number of data bytes
+			data_len = 4;
 			response.data.u8[3] = 0x00; // Data byte 1
 			response.data.u8[4] = 0x18; // Data byte 2
 			response.data.u8[5] = 0x80; // Data byte 3
 			response.data.u8[6] = 0x00; // Data byte 4
 			break;
 		case 0x0C: // RPM
-			response.data.u8[0] += 2; // Number of data bytes
-			obdRevConvert_0C(vehicle_rpm, &response.data.u8[3], &response.data.u8[4], 0, 0);
+			data_len = obdRevConvert_0C(vehicle_rpm, &A, &B, &C, &D);
+			response.data.u8[3] = (uint8_t)A;
+			response.data.u8[4] = (uint8_t)B;
 			break;
 		case 0x0D: // Speed
-			response.data.u8[0] += 1; // Number of data bytes
-			obdRevConvert_0D(vehicle_speed, &response.data.u8[3], 0, 0, 0);
+			data_len = obdRevConvert_0D(vehicle_speed, &A, &B, &C, &D);
+			response.data.u8[3] = (uint8_t)A;
 			break;
 		case 0x11: // Throttle position
-			response.data.u8[0] += 1; // Number of data bytes
-			obdRevConvert_11(vehicle_throttle, &response.data.u8[3], 0, 0, 0);
+			data_len = obdRevConvert_11(vehicle_throttle, &A, &B, &C, &D);
+			response.data.u8[3] = (uint8_t)A;
+			break;
+		case 0x05: // Coolant temperature
+			data_len = obdRevConvert_05(vehicle_coolant, &A, &B, &C, &D);
+			response.data.u8[3] = (uint8_t)A;
+			break;
+		case 0x2F: // Fuel level
+			data_len = obdRevConvert_2F(vehicle_fuel_level, &A, &B, &C, &D);
+			response.data.u8[3] = (uint8_t)A;
 			break;
 	}
 
-	sendOBDResponse(&response);
+	if (data_len > 0) {
+		response.data.u8[0] = 2 + data_len; // Mode + PID + Data bytes
+		sendOBDResponse(&response);
+	} else {
+		DEBUG_PRINT("Unsupported PID 0x%02x or conversion failed\n", pid);
+	}
 }
 
 void respondToOBD9(uint8_t pid)
 {
-	printf("Responding to Mode 9 PID 0x%02x\n", pid);
+	DEBUG_PRINT("Building Mode 9 response for PID 0x%02x\n", pid);
 
 	CAN_frame_t response = createOBDResponse(9, pid);
 
 	switch (pid)
 	{
 		case 0x00: // Supported PIDs
-			response.data.u8[0] += 4; // Number of data bytes
+			response.data.u8[0] = 6; // Mode + PID + 4 bytes
 			response.data.u8[3] = 0x40; // Data byte 1
 			response.data.u8[4] = 0x00; // Data byte 2
 			response.data.u8[5] = 0x00; // Data byte 3
@@ -197,33 +226,45 @@ void task_CAN(void *pvParameters)
 	//frame buffer
 	CAN_frame_t __RX_frame;
 
-	//create CAN RX Queue
+	//create CAN RX Queue BEFORE CAN_init
 	CAN_cfg.rx_queue = xQueueCreate(10, sizeof(CAN_frame_t));
 
 	//start CAN Module
 	CAN_init();
 	printf("CAN initialized...\n");
 
+	// DEBUG: Send test speed frame at startup
+	vehicle_speed = 85; // Set test speed to 85 km/h
+	CAN_frame_t test_frame = createOBDResponse(1, 0x0D); // Speed PID
+	test_frame.data.u8[0] = 3; // Data length (Mode + PID + 1 byte value)
+	test_frame.data.u8[3] = 85; // Speed value
+	CAN_write_frame(&test_frame);
+	DEBUG_PRINT("Sent test speed frame: 85 km/h\n");
+
+	// Track time for periodic diagnostics
+	TickType_t last_diagnostic_time = xTaskGetTickCount();
+
 	while (1)
 	{
 		//receive next CAN frame from queue
 		if (xQueueReceive(CAN_cfg.rx_queue, &__RX_frame, 3 * portTICK_PERIOD_MS) == pdTRUE)
 		{
-			printf("\nFrame from : 0x%08x, DLC %d, RTR %d, FF %d \n", __RX_frame.MsgID, __RX_frame.FIR.B.DLC,
-				   __RX_frame.FIR.B.RTR, __RX_frame.FIR.B.FF);
-			printf("D0: 0x%02x, ", __RX_frame.data.u8[0]);
-			printf("D1: 0x%02x, ", __RX_frame.data.u8[1]);
-			printf("D2: 0x%02x, ", __RX_frame.data.u8[2]);
-			printf("D3: 0x%02x, ", __RX_frame.data.u8[3]);
-			printf("D4: 0x%02x, ", __RX_frame.data.u8[4]);
-			printf("D5: 0x%02x, ", __RX_frame.data.u8[5]);
-			printf("D6: 0x%02x, ", __RX_frame.data.u8[6]);
-			printf("D7: 0x%02x\n", __RX_frame.data.u8[7]);
-			printf("==============================================================================\n");
+			printf("RX ID: 0x%03" PRIx32 " Data: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+				   __RX_frame.MsgID,
+				   __RX_frame.data.u8[0], __RX_frame.data.u8[1], __RX_frame.data.u8[2], __RX_frame.data.u8[3],
+				   __RX_frame.data.u8[4], __RX_frame.data.u8[5], __RX_frame.data.u8[6], __RX_frame.data.u8[7]);
+
+			DEBUG_PRINT("\nRX CAN Frame:\n");
+			DEBUG_PRINT("  MsgID: 0x%08" PRIx32 "\n", __RX_frame.MsgID);
+			DEBUG_PRINT("  DLC: %d, RTR: %d, FF: %d\n", __RX_frame.FIR.B.DLC, __RX_frame.FIR.B.RTR, __RX_frame.FIR.B.FF);
+			DEBUG_PRINT("  Data: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+					   __RX_frame.data.u8[0], __RX_frame.data.u8[1], __RX_frame.data.u8[2], __RX_frame.data.u8[3],
+					   __RX_frame.data.u8[4], __RX_frame.data.u8[5], __RX_frame.data.u8[6], __RX_frame.data.u8[7]);
 
 			// Check if frame is OBD query
 			if (__RX_frame.MsgID == 0x7df) {
-				printf("OBD QUERY !\n");
+				DEBUG_PRINT("  Type: OBD QUERY\n");
+				DEBUG_PRINT("  Mode: 0x%02x, PID: 0x%02x\n\n", __RX_frame.data.u8[1], __RX_frame.data.u8[2]);
 
 				switch (__RX_frame.data.u8[1]) { // Mode
 					case 1: // Show current data
@@ -231,14 +272,12 @@ void task_CAN(void *pvParameters)
 						break;
 					case 9: // Vehicle information
 						respondToOBD9(__RX_frame.data.u8[2]);
-						break;
-					default:
-						printf("Unsupported mode %d !\n", __RX_frame.data.u8[1]);
+					break;
+				default:
+					DEBUG_PRINT("  Unsupported mode: 0x%02x\n\n", __RX_frame.data.u8[1]);
 				}
 			} else if (__RX_frame.MsgID == 0x7e0) { // Check if frame is addressed to the ECU (us)
-				printf("ECU MSG !\n");
-
-				if (__RX_frame.data.u8[0] == 0x30) { // Flow control frame (continue)
+				DEBUG_PRINT("  Type: ECU MSG\n\n");				if (__RX_frame.data.u8[0] == 0x30) { // Flow control frame (continue)
 					CAN_frame_t response = createOBDResponse(0, 0);
 
 					for (int i = 0; i < 5; i++) {
@@ -279,6 +318,54 @@ char * get_type_for_filename_ext(char *filename)
 	return NULL;
 }
 
+static void cb_GET_root(http_context_t http_ctx, void *ctx)
+{
+	const char *html = 
+		"<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+		"<title>ESP32 OBD-II Emulator</title><style>"
+		"body{background:#222;color:#fff;font:16px sans-serif;margin:0;padding:20px}h1,h3{text-align:center;margin:10px}"
+		".row{display:flex;justify-content:space-around;flex-wrap:wrap;margin:20px 0}.col{flex:1;min-width:250px;margin:15px;background:#333;padding:20px;border-radius:10px}"
+		"h1{font-size:3em;margin:0}h3{font-size:1.2em;color:#aaa;margin:10px 0}.slidecontainer{margin:20px 0}"
+		".slider{width:100%;height:10px;border-radius:5px;background:#555;outline:none;border:none;cursor:pointer}"
+		".slider::-webkit-slider-thumb{-webkit-appearance:none;width:25px;height:25px;border-radius:50%;background:#0ae;cursor:pointer}"
+		".slider::-moz-range-thumb{width:25px;height:25px;border-radius:50%;background:#0ae;cursor:pointer;border:none}"
+		".info{background:#2a2a2a;padding:15px;border-radius:8px;margin:10px 15px;border-left:4px solid #0ae}"
+		".label{color:#aaa;font-weight:bold;display:inline-block;min-width:120px}"
+		"</style></head><body>"
+		"<h3>🚗 ESP32 OBD-II EMULATOR</h3>"
+		"<div style='max-width:800px;margin:0 auto'>"
+		"<div class='info'><span class='label'>Status:</span> ✅ Running</div>"
+		"<div class='info'><span class='label'>CAN RX:</span> GPIO 43</div>"
+		"<div class='info'><span class='label'>CAN TX:</span> GPIO 44</div>"
+		"<div class='info'><span class='label'>CAN Speed:</span> 500 kbps</div>"
+		"<div class='info'><span class='label'>VIN:</span> ESP32OBD2EMULATOR</div>"
+		"</div>"
+		"<div class='row'>"
+		"<div class='col'><h1 id='current-speed'>0</h1><h3>SPEED (km/h)</h3>"
+		"<div class='slidecontainer'><input type='range' min='0' max='255' value='0' class='slider' id='speed'></div></div>"
+		"<div class='col'><h1 id='current-rpm'>0</h1><h3>RPM</h3>"
+		"<div class='slidecontainer'><input type='range' min='0' max='16654' value='0' class='slider' id='rpm'></div></div>"
+		"<div class='col'><h1 id='current-throttle'>0</h1><h3>THROTTLE (%)</h3>"
+		"<div class='slidecontainer'><input type='range' min='0' max='100' value='0' class='slider' id='throttle'></div></div>"
+		"<div class='col'><h1 id='current-coolant'>90</h1><h3>COOLANT (°C)</h3>"
+		"<div class='slidecontainer'><input type='range' min='-40' max='215' value='90' class='slider' id='coolant'></div></div>"
+		"<div class='col'><h1 id='current-fuel'>100</h1><h3>FUEL (%)</h3>"
+		"<div class='slidecontainer'><input type='range' min='0' max='100' value='100' class='slider' id='fuel'></div></div>"
+		"</div><script>"
+		"function update(n,v){var x=new XMLHttpRequest();x.open('PATCH','/api/vehicle',true);"
+		"x.setRequestHeader('Content-Type','application/x-www-form-urlencoded');x.send('name='+n+'&value='+v)}"
+		"function link(s,o,n){var slider=document.getElementById(s),output=document.getElementById(o),timer;"
+		"output.innerHTML=slider.value;slider.oninput=function(){"
+		"output.innerHTML=this.value;clearTimeout(timer);timer=setTimeout(function(){update(n,slider.value)},100)}}"
+		"link('speed','current-speed','speed');link('rpm','current-rpm','rpm');link('throttle','current-throttle','throttle');link('coolant','current-coolant','coolant');link('fuel','current-fuel','fuel');"
+		"</script></body></html>";
+	
+	http_response_begin(http_ctx, 200, "text/html", strlen(html));
+	http_buffer_t http_response = { .data = html };
+	http_response_write(http_ctx, &http_response);
+	http_response_end(http_ctx);
+}
+
 static void cb_GET_file(http_context_t http_ctx, void *ctx)
 {
 	char *file = malloc(FILE_MAX_SIZE + 1);
@@ -309,6 +396,10 @@ static void cb_PATCH_vehicle(http_context_t http_ctx, void* ctx)
 			vehicle_rpm = strtol(value, NULL, 10);
 		} else if (strcmp(name, "throttle") == 0) {
 			vehicle_throttle = strtof(value, NULL);
+		} else if (strcmp(name, "coolant") == 0) {
+			vehicle_coolant = strtof(value, NULL);
+		} else if (strcmp(name, "fuel") == 0) {
+			vehicle_fuel_level = strtof(value, NULL);
 		} else if (strcmp(name, "vin") == 0) {
 			strncpy(vehicle_vin, value, 17);
 		}
@@ -327,8 +418,9 @@ void wifi_init_softap()
 {
 	wifi_event_group = xEventGroupCreate();
 
-	tcpip_adapter_init();
-	ESP_ERROR_CHECK(esp_event_loop_init(event_handler, NULL));
+	ESP_ERROR_CHECK(esp_netif_init());
+	ESP_ERROR_CHECK(esp_event_loop_create_default());
+	esp_netif_create_default_wifi_ap();
 
 	wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
 	ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -347,7 +439,11 @@ void wifi_init_softap()
 
 	ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
 	ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &wifi_config));
+	
 	ESP_ERROR_CHECK(esp_wifi_start());
+
+	// Reduce WiFi TX power to prevent brownout
+	ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(44)); // 11 dBm (default is 20 dBm/80)
 
 	printf("wifi_init_softap finished.SSID:%s password:%s\n", WIFI_SSID, WIFI_PASS);
 }
@@ -364,10 +460,7 @@ void app_main()
 	printf("kBit/s setting was done by User\n");
 #endif
 
-	//Create CAN receive task
-	xTaskCreate(&task_CAN, "CAN", 2048, NULL, 5, NULL);
-
-	///////////////// WIFI	
+	///////////////// NVS - Initialize FIRST before any tasks
 
 	esp_err_t ret = nvs_flash_init();
 	if (ret == ESP_ERR_NVS_NO_FREE_PAGES)
@@ -376,6 +469,8 @@ void app_main()
 		ret = nvs_flash_init();
 	}
 	ESP_ERROR_CHECK(ret);
+
+	///////////////// WIFI	
 
 	printf("Initializing WIFI...\n");
 	wifi_init_softap();
@@ -386,21 +481,36 @@ void app_main()
 
 	http_server_t server;
 	http_server_options_t http_options = HTTP_SERVER_OPTIONS_DEFAULT();
-	esp_err_t res;
 
 	ESP_ERROR_CHECK(http_server_start(&http_options, &server));
-	ESP_ERROR_CHECK(http_register_handler(server, "/", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/index.html"));
-	ESP_ERROR_CHECK(http_register_handler(server, "/main.css", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/main.css"));
-	ESP_ERROR_CHECK(http_register_handler(server, "/main.js", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/main.js"));
+	ESP_ERROR_CHECK(http_register_handler(server, "/", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_root, NULL));
+	// Full web UI requires FAT filesystem - see instructions above
+	// ESP_ERROR_CHECK(http_register_handler(server, "/", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/index.html"));
+	// ESP_ERROR_CHECK(http_register_handler(server, "/main.css", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/main.css"));
+	// ESP_ERROR_CHECK(http_register_handler(server, "/main.js", HTTP_GET, HTTP_HANDLE_RESPONSE, &cb_GET_file, "/spiflash/main.js"));
 	ESP_ERROR_CHECK(http_register_form_handler(server, "/api/vehicle", HTTP_PATCH, HTTP_HANDLE_RESPONSE, &cb_PATCH_vehicle, NULL));
 
-	////////////////// FAT
-
+	////////////////// FAT - Disabled (requires partition table reflash)
+	// Close monitor first, then run: idf.py -p /dev/ttyACM0 flash
+	/*
 	esp_vfs_fat_mount_config_t mountConfig;
 	wl_handle_t m_wl_handle;
 	mountConfig.max_files = 4;
 	mountConfig.format_if_mount_failed = false;
 	ESP_ERROR_CHECK(esp_vfs_fat_spiflash_mount("/spiflash", "storage", &mountConfig, &m_wl_handle));
-
+	printf("FAT filesystem mounted successfully\n");
 	ESP_ERROR_CHECK(dumpDir("/spiflash"));
+	*/
+
+	printf("\n========================================\n");
+	printf("ESP32-S3 OBD-II Emulator Ready!\n");
+	printf("WiFi AP: %s / %s\n", WIFI_SSID, WIFI_PASS);
+	printf("Web UI: http://192.168.4.1\n");
+	printf("CAN: RX=GPIO%d TX=GPIO%d @ %d kbps\n", 
+		CAN_cfg.rx_pin_id, CAN_cfg.tx_pin_id, CAN_cfg.speed);
+	printf("========================================\n\n");
+
+	//Create CAN receive task - START LAST after all initialization
+	// Increased stack size to 4096 bytes for debug logging
+	xTaskCreate(&task_CAN, "CAN", 4096, NULL, 5, NULL);
 }

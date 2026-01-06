@@ -14,27 +14,27 @@ config ESP_CAN_NODE_ITSELF
 
 config ESP_CAN_RXD_PIN_NUM
     int "Pin Number of CAN RXD"
-    range 4 5
-    default 4
+    range 0 48
+    default 43
     depends on ESPCAN
     help
         Number of CAN_RXD_PIN_NUM.
 		Can be any unpulled GPIO. Check PIN List.
-        Tested with GPIO4 so this is default.
+        Default GPIO43 for ESP32-S3 with level shifter.
 
 config ESP_CAN_TXD_PIN_NUM
     int "Pin Number of CAN TXD"
-    range 4 5
-    default 5
+    range 0 48
+    default 44
     depends on ESPCAN
     help
         Number of CAN_TXD_PIN_NUM.
 		Can be any unpulled GPIO. Check PIN List
-        Tested with GPIO5 so this is default.
+        Default GPIO44 for ESP32-S3 with level shifter.
 
 choice ESP_CAN_SPEED
     prompt "Select the ESP_CAN_SPEED used for the ESP CAN Driver"
-	default CONFIG_CAN_SPEED_125KBPS
+	default CAN_SPEED_500KBPS
 	depends on ESPCAN
 	help
 		CAN_SPEED_100KBPS 		CAN Node runs at 100kBits.

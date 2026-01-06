@@ -92,4 +92,9 @@ int CAN_write_frame(const CAN_frame_t *p_frame);
  */
 int CAN_stop(void);
 
+/**
+ * \brief Print CAN bus diagnostics (error counters, state)
+ */
+void CAN_print_diagnostics(void);
+
 #endif

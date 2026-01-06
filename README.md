@@ -21,18 +21,28 @@ Open-source OBD-II emulator based on an ESP32 + CAN transceiver IC, controllable
 3. Enjoy :)
 
 ## Hardware
-- ESP32-WROOM-32
-- SN65HVD230 (or any other CAN transceiver IC)
+- ESP32-S3 (or ESP32-WROOM-32)
+- TJA1051 CAN transceiver (5V) with level shifter, or SN65HVD230 (3.3V)
+- Bi-directional logic level shifter (3.3V ↔ 5V) - required for TJA1051
 - Serial->USB adapter
-- Power supply (3.3V)
+- Power supply (3.3V for ESP32, 5V for TJA1051)
 
 ![ESP32-WROOM-32](docs/esp32-wroom.jpg)
 ![SN65HVD230](docs/transceiver.jpg)
 ![Schematic](docs/schematic.jpg)
 
 ### Connections
-- IO 4 -> CAN RX
-- IO 5 -> CAN TX
+
+**ESP32-S3 with TJA1051 (5V) + Level Shifter:**
+- ESP32-S3 GPIO 43 (RX) ← Level Shifter ← TJA1051 RXD
+- ESP32-S3 GPIO 44 (TX) → Level Shifter → TJA1051 TXD
+- TJA1051 VCC → 5V
+- TJA1051 STB → GND (normal mode)
+- TJA1051 CANH/CANL → CAN Bus (with 120Ω termination resistor if needed)
+
+**Legacy ESP32-WROOM-32 with SN65HVD230 (3.3V):**
+- IO 4 → CAN RX
+- IO 5 → CAN TX
 
 ## Flash / Install (via [esptool](https://github.com/espressif/esptool))
 1. Download the latest release binaries
